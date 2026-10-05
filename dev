@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# 一条命令启动：校园食堂餐具丢失赔付与集中盘点系统
+#
+#   ./dev up      安装依赖（如需）→ 迁移+种子+演示数据 → 同时启动后端(8000)与前端(5173)
+#   ./dev test    运行后端全部自动化验证（跨窗口归还 / 冻结 / 钱数分账）
+#   ./dev reset   清空数据库并重新写入演示数据
+#   ./dev down   停止正在运行的服务
+#
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+BACKEND="$ROOT/backend"
+FRONTEND="$ROOT/frontend"
+LOG_DIR="$ROOT/.run"
+mkdir -p "$LOG_DIR"
+
+# 兼容无系统 PHP、仅安装了用户态 PHP 的环境
+if ! command -v php >/dev/null 2>&1; then
+  if [ -x "$HOME/.local/bin/php" ]; then
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+fi
+command -v php >/dev/null 2>&1 || { echo "未找到 php，请先安装 PHP 8.2+（含 sqlite/mbstring/xml 扩展）"; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "未找到 node，请先安装 Node.js 18+"; exit 1; }
+
+backend_pid_file="$LOG_DIR/backend.pid"
+frontend_pid_file="$LOG_DIR/frontend.pid"
+
+stop_services() {
+  for f in "$frontend_pid_file" "$backend_pid_file"; do
+    if [ -f "$f" ]; then
+      pid="$(cat "$f" || true)"
+      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+      rm -f "$f"
+    fi
+  done
+  # 清理可能残留的子进程
+  pkill -f "server.php" 2>/dev/null || true
+  pkill -f "vite --host 127.0.0.1 --port 5173" 2>/dev/null || true
+}
+
+cmd_up() {
+  echo "▶ 检查后端依赖"
+  [ -d "$BACKEND/vendor" ] || (cd "$BACKEND" && composer install --no-audit --no-interaction)
+  echo "▶ 检查前端依赖"
+  [ -d "$FRONTEND/node_modules" ] || (cd "$FRONTEND" && npm install)
+
+  echo "▶ 初始化数据库（迁移 + 基础数据 + 演示场景）"
+  (cd "$BACKEND" && php artisan migrate:fresh --seed --force >/dev/null)
+  (cd "$BACKEND" && php artisan db:seed --class=DemoScenarioSeeder --force >/dev/null) || true
+
+  stop_services
+  trap stop_services EXIT INT TERM
+
+  echo "▶ 启动 Laravel API  → http://127.0.0.1:8000"
+  # 用单进程内置服务器（-c ini 随 wrapper 生效），避免 artisan serve 派生子进程丢扩展
+  (cd "$BACKEND" && php -S 127.0.0.1:8000 -t public server.php) \
+    >"$LOG_DIR/backend.log" 2>&1 &
+  echo $! > "$backend_pid_file"
+
+  echo "▶ 启动 React 前端   → http://127.0.0.1:5173 （/api 代理到 8000）"
+  (cd "$FRONTEND" && npm run dev) \
+    >"$LOG_DIR/frontend.log" 2>&1 &
+  echo $! > "$frontend_pid_file"
+
+  cat <<EOF
+
+──────────────────────────────────────────────────────────
+  系统已启动：
+    前端工作台 : http://127.0.0.1:5173
+    后端 API   : http://127.0.0.1:8000/api/dashboard
+  演示账号（在右上角切换）：
+    王芳/李强 = 窗口员工，周敏 = 主管（盘点确认/冻结）
+  按 Ctrl+C 停止前后端；日志见 $LOG_DIR/*.log
+──────────────────────────────────────────────────────────
+EOF
+
+  wait
+}
+
+cmd_test() {
+  echo "▶ 运行后端自动化验证（PHPUnit，内存 SQLite）"
+  (cd "$BACKEND" && php artisan test)
+}
+
+cmd_reset() {
+  echo "▶ 重置数据库并重写演示数据"
+  (cd "$BACKEND" && php artisan migrate:fresh --seed --force)
+  (cd "$BACKEND" && php artisan db:seed --class=DemoScenarioSeeder --force)
+}
+
+cmd_down() {
+  echo "▶ 停止服务"
+  stop_services
+}
+
+case "${1:-up}" in
+  up|start) cmd_up ;;
+  test)     cmd_test ;;
+  reset)    cmd_reset ;;
+  down|stop) cmd_down ;;
+  *) echo "用法: ./dev [up|test|reset|down]"; exit 1 ;;
+esac
